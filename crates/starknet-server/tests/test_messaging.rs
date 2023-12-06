@@ -12,7 +12,9 @@ pub mod common;
 
 mod test_messaging {
     use std::sync::Arc;
+    use std::str::FromStr;
 
+    use ethers::prelude::*;
     use hyper::{Body, StatusCode};
     use serde_json::json;
     use starknet_core::utils::exported_test_utils::dummy_cairo_l1l2_contract;
@@ -276,4 +278,98 @@ mod test_messaging {
             "0xc918bd19487589d1acf7558c0e3ffbc994939b5779af354f92e36a5674532137"
         );
     }
+
+    #[tokio::test]
+    async fn can_interact_with_l1() {
+        let anvil = BackgroundAnvil::spawn().await.unwrap();
+
+        let (devnet, sn_account, sn_l1l2_contract) = setup_devnet(&["--account-class", "cairo1"]).await;
+
+        // Load l1 messaging contract.
+        let req_body = Body::from(json!({ "network_url": anvil.url }).to_string());
+        let resp = devnet
+            .post_json("/postman/load_l1_messaging_contract".into(), req_body)
+            .await
+            .expect("deploy l1 messaging contract failed");
+
+        assert_eq!(resp.status(), StatusCode::OK, "Checking status of {resp:?}");
+
+        let body = get_json_body(resp).await;
+        assert_eq!(
+            body.get("messaging_contract_address").unwrap().as_str().unwrap(),
+            "0x5fbdb2315678afecb367f032d93f642f64180aa3"
+        );
+
+        // Deploy the L1L2 testing contract on L1 (on L2 it's already pre-deployed).
+        let l1_messaging_address = H160::from_str("0x5fbdb2315678afecb367f032d93f642f64180aa3").unwrap();
+        let eth_l1l2_contract = anvil.deploy_l1l2_contract(l1_messaging_address).await.unwrap();
+        assert_eq!(
+            eth_l1l2_contract,
+            H160::from_str("0xe7f1725e7734ce288f8367e1bb143e90bb3f0512").unwrap()
+        );
+
+        let user_sn = FieldElement::ONE;
+        let user_eth: U256 = 1.into();
+
+        // Set balance to 1 for the user 1.
+        let user_balance = FieldElement::ONE;
+        increase_balance(Arc::clone(&sn_account), sn_l1l2_contract, user_sn, user_balance).await;
+        assert_eq!(get_balance(&devnet, sn_l1l2_contract, user_sn).await, [user_balance]);
+
+        // Withdraw the amount 1 from user 1 in a l2->l1 message.
+        withdraw(Arc::clone(&sn_account), sn_l1l2_contract, user_sn, user_balance).await;
+        assert_eq!(get_balance(&devnet, sn_l1l2_contract, user_sn).await, [FieldElement::ZERO]);
+
+        // Flush to send the messages.
+        let resp = devnet.post_json("/postman/flush".into(), "".into()).await.expect("flush failed");
+        let body = get_json_body(resp).await;
+        println!("body: {:?}", body);
+        println!("sn: {:?}", sn_l1l2_contract);
+        println!("account: {:?}", sn_account.address());
+        //assert_eq!(resp.status(), StatusCode::OK, "Checking status of {resp:?}");
+
+        // Check that the balance is 0 on L1 before consuming the message.
+        let user_balance_eth = anvil.get_balance_l1l2(eth_l1l2_contract, user_eth).await.unwrap();
+        assert_eq!(user_balance_eth, 0.into());
+
+        let sn_l1l2_contract_u256 = U256::from_str_radix(
+            &format!("0x{:64x}", sn_l1l2_contract), 16).unwrap();
+
+        let account_address_u256 = U256::from_str_radix(
+            &format!("0x{:64x}", sn_account.address()), 16).unwrap();
+        println!("account: {:?}", sn_account.address());
+        println!("account u256: {:?}", account_address_u256);
+        println!("account u256: {:#x}", account_address_u256);
+
+        // Consume the message to increase the balance.
+        anvil.withdraw_l1l2(
+            eth_l1l2_contract,
+            account_address_u256,
+            user_eth,
+            1.into(),
+        ).await.unwrap();
+
+        let user_balance_eth = anvil.get_balance_l1l2(eth_l1l2_contract, user_eth).await.unwrap();
+        assert_eq!(user_balance_eth, 2.into());
+
+        // Send back the amount 1 to the user 1 on L2.
+        anvil.deposit_l1l2(
+            eth_l1l2_contract,
+            sn_l1l2_contract_u256,
+            user_eth,
+            1.into(),
+        ).await.unwrap();
+
+        let user_balance_eth = anvil.get_balance_l1l2(eth_l1l2_contract, user_eth).await.unwrap();
+        assert_eq!(user_balance_eth, 0.into());
+        assert_eq!(get_balance(&devnet, sn_l1l2_contract, user_sn).await, [FieldElement::ZERO]);
+
+        // Flush messages to have MessageToL2 executed.
+        let resp = devnet.post_json("/postman/flush".into(), "".into()).await.expect("flush failed");
+        assert_eq!(resp.status(), StatusCode::OK, "Checking status of {resp:?}");
+
+        // Ensure the balance is back to 1 on L2.
+        assert_eq!(get_balance(&devnet, sn_l1l2_contract, user_sn).await, [FieldElement::ONE]);
+    }
+
 }
